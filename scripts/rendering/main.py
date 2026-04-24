@@ -7,7 +7,6 @@ import random
 import subprocess
 import tempfile
 import time
-import zipfile
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -40,24 +39,6 @@ def log_processed_object(csv_filename: str, *args) -> None:
         f.write(f"{time.time()},{args}\n")
 
 
-def zipdir(path: str, ziph: zipfile.ZipFile) -> None:
-    """Zip up a directory with an arcname structure.
-
-    Args:
-        path (str): Path to the directory to zip.
-        ziph (zipfile.ZipFile): ZipFile handler object to write to.
-
-    Returns:
-        None
-    """
-    # ziph is zipfile handle
-    for root, dirs, files in os.walk(path):
-        for file in files:
-            # this ensures the structure inside the zip starts at folder/
-            arcname = os.path.join(os.path.basename(root), file)
-            ziph.write(os.path.join(root, file), arcname=arcname)
-
-
 def handle_found_object(
     local_path: str,
     file_identifier: str,
@@ -68,6 +49,7 @@ def handle_found_object(
     only_northern_hemisphere: bool,
     gpu_devices: Union[int, List[int]],
     render_timeout: int,
+    trajectory: bool = False,
     successful_log_file: Optional[str] = "handle-found-object-successful.csv",
     failed_log_file: Optional[str] = "handle-found-object-failed.csv",
 ) -> bool:
@@ -93,6 +75,7 @@ def handle_found_object(
             If 0, the CPU will be used for rendering.
         render_timeout (int): Number of seconds to wait for the rendering job to
             complete.
+        trajectory (bool): Whether to use a trajectory of actions to render the object.
         successful_log_file (str): Name of the log file to save successful renders to.
         failed_log_file (str): Name of the log file to save failed renders to.
 
@@ -100,6 +83,9 @@ def handle_found_object(
     """
     save_uid = get_uid_from_str(file_identifier)
     args = f"--object_path '{local_path}' --num_renders {num_renders}"
+
+    if trajectory:
+        args += " --trajectory"
 
     # get the GPU to use for rendering
     using_gpu: bool = True
@@ -123,14 +109,15 @@ def handle_found_object(
         args += f" --output_dir {target_directory}"
 
         # check for Linux / Ubuntu or MacOS
-        if platform.system() == "Linux" and using_gpu:
-            args += " --engine BLENDER_EEVEE"
-        elif platform.system() == "Darwin" or (
-            platform.system() == "Linux" and not using_gpu
+        if (platform.system() == "Linux" and using_gpu) or (
+            platform.system() == "Darwin" and using_gpu
         ):
-            # As far as I know, MacOS does not support BLENER_EEVEE, which uses GPU
-            # rendering. Generally, I'd only recommend using MacOS for debugging and
-            # small rendering jobs, since CYCLES is much slower than BLENDER_EEVEE.
+            args += " --engine BLENDER_EEVEE"
+        elif (
+            platform.system() == "Darwin"
+            and not using_gpu
+            or (platform.system() == "Linux" and not using_gpu)
+        ):
             args += " --engine CYCLES"
         else:
             raise NotImplementedError(f"Platform {platform.system()} is not supported.")
@@ -140,8 +127,8 @@ def handle_found_object(
             args += " --only_northern_hemisphere"
 
         # get the command to run
-        command = f"blender-3.2.2-linux-x64/blender --background --python blender_script.py -- {args}"
-        if using_gpu:
+        command = f"Blender.app/Contents/MacOS/Blender --background --python blender_script.py -- {args}"
+        if using_gpu and platform.system() == "Linux":
             command = f"export DISPLAY=:0.{gpu_i} && {command}"
 
         # render the object (put in dev null)
@@ -149,17 +136,16 @@ def handle_found_object(
             ["bash", "-c", command],
             timeout=render_timeout,
             check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
         )
 
         # check that the renders were saved successfully
         png_files = glob.glob(os.path.join(target_directory, "*.png"))
         metadata_files = glob.glob(os.path.join(target_directory, "*.json"))
-        npy_files = glob.glob(os.path.join(target_directory, "*.npy"))
+        #npy_files = glob.glob(os.path.join(target_directory, "*.npy"))
         if (
             (len(png_files) != num_renders)
-            or (len(npy_files) != num_renders)
+        #    or (len(npy_files) != num_renders)
             or (len(metadata_files) != 1)
         ):
             logger.error(
@@ -184,21 +170,15 @@ def handle_found_object(
         with open(metadata_path, "w", encoding="utf-8") as f:
             json.dump(metadata_file, f, indent=2, sort_keys=True)
 
-        # Make a zip of the target_directory.
-        # Keeps the {save_uid} directory structure when unzipped
-        with zipfile.ZipFile(
-            f"{target_directory}.zip", "w", zipfile.ZIP_DEFLATED
-        ) as ziph:
-            zipdir(target_directory, ziph)
-
-        # move the zip to the render_dir
+        # move the directory to the render_dir
         fs, path = fsspec.core.url_to_fs(render_dir)
 
-        # move the zip to the render_dir
+        # move the directory to the render_dir
         fs.makedirs(os.path.join(path, "renders"), exist_ok=True)
         fs.put(
-            os.path.join(f"{target_directory}.zip"),
-            os.path.join(path, "renders", f"{save_uid}.zip"),
+            target_directory,
+            os.path.join(path, "renders", save_uid),
+            recursive=True,
         )
 
         # log that this object was rendered successfully
@@ -248,6 +228,7 @@ def handle_modified_object(
     only_northern_hemisphere: bool,
     gpu_devices: Union[int, List[int]],
     render_timeout: int,
+    trajectory: bool = False,
 ) -> None:
     """Called when a modified object is found and downloaded.
 
@@ -274,6 +255,7 @@ def handle_modified_object(
             If 0, the CPU will be used for rendering.
         render_timeout (int): Number of seconds to wait for the rendering job to
             complete.
+        trajectory (bool): Whether to use a trajectory of actions to render the object.
 
     Returns:
         None
@@ -288,24 +270,10 @@ def handle_modified_object(
         only_northern_hemisphere=only_northern_hemisphere,
         gpu_devices=gpu_devices,
         render_timeout=render_timeout,
+        trajectory=trajectory,
         successful_log_file=None,
         failed_log_file=None,
     )
-
-    if success:
-        log_processed_object(
-            "handle-modified-object-successful.csv",
-            file_identifier,
-            old_sha256,
-            new_sha256,
-        )
-    else:
-        log_processed_object(
-            "handle-modified-object-failed.csv",
-            file_identifier,
-            old_sha256,
-            new_sha256,
-        )
 
 
 def handle_missing_object(
@@ -345,8 +313,9 @@ def render_objects(
     processes: Optional[int] = None,
     save_repo_format: Optional[Literal["zip", "tar", "tar.gz", "files"]] = None,
     only_northern_hemisphere: bool = False,
-    render_timeout: int = 300,
+    render_timeout: int = 30000,
     gpu_devices: Optional[Union[int, List[int]]] = None,
+    trajectory: bool = False,
 ) -> None:
     """Renders objects in the Objaverse-XL dataset with Blender
 
@@ -373,6 +342,8 @@ def render_objects(
             gpu_devices - 1. If a list, the GPU device will be randomly selected from
             the list. If 0, the CPU will be used for rendering. If None, all available
             GPUs will be used. Defaults to None.
+        trajectory (bool, optional): Whether to use a trajectory of actions to render the
+            object. Defaults to False.
 
     Returns:
         None
@@ -393,27 +364,33 @@ def render_objects(
     # get the gpu devices to use
     parsed_gpu_devices: Union[int, List[int]] = 0
     if gpu_devices is None:
-        parsed_gpu_devices = len(GPUtil.getGPUs())
+        if platform.system() == "Darwin":
+            parsed_gpu_devices = 1  # assuming at least 1 GPU on Mac
+        else:
+            parsed_gpu_devices = len(GPUtil.getGPUs())
+    else:
+        parsed_gpu_devices = gpu_devices
     logger.info(f"Using {parsed_gpu_devices} GPU devices for rendering.")
 
     if processes is None:
         processes = multiprocessing.cpu_count() * 3
 
     # get the objects to render
-    objects = get_example_objects()
+    objects = oxl.get_alignment_annotations(download_dir=download_dir)
     objects.iloc[0]["fileIdentifier"]
     objects = objects.copy()
+    objects = objects[0:5]
     logger.info(f"Provided {len(objects)} objects to render.")
 
     # get the already rendered objects
     fs, path = fsspec.core.url_to_fs(render_dir)
     try:
-        zip_files = fs.glob(os.path.join(path, "renders", "*.zip"), refresh=True)
+        rendered_paths = fs.glob(os.path.join(path, "renders", "*"), refresh=True)
     except TypeError:
         # s3fs may not support refresh depending on the version
-        zip_files = fs.glob(os.path.join(path, "renders", "*.zip"))
+        rendered_paths = fs.glob(os.path.join(path, "renders", "*"))
 
-    saved_ids = set(zip_file.split("/")[-1].split(".")[0] for zip_file in zip_files)
+    saved_ids = set(p.rstrip("/").split("/")[-1] for p in rendered_paths)
     logger.info(f"Found {len(saved_ids)} objects already rendered.")
 
     # filter out the already rendered objects
@@ -437,6 +414,7 @@ def render_objects(
             only_northern_hemisphere=only_northern_hemisphere,
             gpu_devices=parsed_gpu_devices,
             render_timeout=render_timeout,
+            trajectory=trajectory,
         ),
         handle_new_object=handle_new_object,
         handle_modified_object=partial(
@@ -446,6 +424,7 @@ def render_objects(
             only_northern_hemisphere=only_northern_hemisphere,
             gpu_devices=parsed_gpu_devices,
             render_timeout=render_timeout,
+            trajectory=trajectory,
         ),
         handle_missing_object=handle_missing_object,
     )

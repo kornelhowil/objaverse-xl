@@ -10,7 +10,77 @@ from typing import Any, Callable, Dict, Generator, List, Literal, Optional, Set,
 
 import bpy
 import numpy as np
-from mathutils import Matrix, Vector
+from mathutils import Matrix, Vector, Quaternion
+
+ACTIONS = ["W", "S", "A", "D", "Q", "E", "X"]
+
+
+def get_next_action(prev_action: Optional[str]) -> str:
+    """Selects the next action based on the previous action.
+
+    The new action is 90% the same as the last action and 10% a random different action.
+    If there is no previous action, 'X' is returned.
+
+    Args:
+        prev_action (Optional[str]): The previous action taken.
+
+    Returns:
+        str: The next action to take.
+    """
+    if prev_action is None:
+        return "X"
+    if random.random() < 0.95:
+        return prev_action
+    return random.choice([a for a in ACTIONS if a != prev_action])
+
+
+def apply_action(matrix: Matrix, action: str, step_size: float = 5.0) -> Matrix:
+    """Applies an action to the camera matrix.
+
+    Args:
+        matrix (Matrix): The current camera matrix.
+        action (str): The action to apply.You
+        step_size (float, optional): The angle in degrees to rotate. Defaults to 1.0.
+
+    Returns:
+        Matrix: The new camera matrix.
+    """
+    if action == "X":
+        return matrix
+
+    # Blender camera: X-Right, Y-Up, Z-Back (Forward is -Z)
+    # Get current local axes in world space
+    right = (matrix.to_3x3() @ Vector((1, 0, 0))).normalized()
+    up = (matrix.to_3x3() @ Vector((0, 1, 0))).normalized()
+    forward = (matrix.to_3x3() @ Vector((0, 0, -1))).normalized()
+
+    angle_rad = math.radians(step_size)
+
+    if action == "W":  # Move Up: Rotate around the Right axis
+        axis = right
+        angle = angle_rad
+    elif action == "S":  # Move Down
+        axis = right
+        angle = -angle_rad
+    elif action == "D":  # Move Right: Rotate around the Up axis
+        axis = up
+        angle = angle_rad
+    elif action == "A":  # Move Left
+        axis = up
+        angle = -angle_rad
+    elif action == "Q":  # Roll Left: Rotate around the Forward axis
+        axis = forward
+        angle = angle_rad
+    elif action == "E":  # Roll Right
+        axis = forward
+        angle = -angle_rad
+    else:
+        return matrix
+
+    # Create rotation matrix around world origin
+    # This moves the camera on the sphere for W/S/A/D and rolls it for Q/E
+    R = Matrix.Rotation(angle, 4, axis)
+    return R @ matrix
 
 IMPORT_FUNCTIONS: Dict[str, Callable] = {
     "obj": bpy.ops.import_scene.obj,
@@ -458,7 +528,7 @@ def normalize_scene() -> None:
                 obj.parent = parent_empty
 
     bbox_min, bbox_max = scene_bbox()
-    scale = 1 / max(bbox_max - bbox_min)
+    scale = 5 / max(bbox_max - bbox_min)
     for obj in get_scene_root_objects():
         obj.scale = obj.scale * scale
 
@@ -735,6 +805,7 @@ def render_object(
     num_renders: int,
     only_northern_hemisphere: bool,
     output_dir: str,
+    trajectory: bool = False,
 ) -> None:
     """Saves rendered images with its camera matrix and metadata of the object.
 
@@ -747,6 +818,8 @@ def render_object(
             holes.
         output_dir (str): Path to the directory where the rendered images and metadata
             will be saved.
+        trajectory (bool, optional): Whether to use a trajectory of actions to render the
+            object. Defaults to False.
 
     Returns:
         None
@@ -768,12 +841,13 @@ def render_object(
     cam.data.sensor_width = 32
 
     # Set up camera constraints
-    cam_constraint = cam.constraints.new(type="TRACK_TO")
-    cam_constraint.track_axis = "TRACK_NEGATIVE_Z"
-    cam_constraint.up_axis = "UP_Y"
-    empty = bpy.data.objects.new("Empty", None)
-    scene.collection.objects.link(empty)
-    cam_constraint.target = empty
+    if not trajectory:
+        cam_constraint = cam.constraints.new(type="TRACK_TO")
+        cam_constraint.track_axis = "TRACK_NEGATIVE_Z"
+        cam_constraint.up_axis = "UP_Y"
+        empty = bpy.data.objects.new("Empty", None)
+        scene.collection.objects.link(empty)
+        cam_constraint.target = empty
 
     # Extract the metadata. This must be done before normalizing the scene to get
     # accurate bounding box information.
@@ -798,34 +872,46 @@ def render_object(
     else:
         metadata["random_color"] = None
 
-    # save metadata
-    metadata_path = os.path.join(output_dir, "metadata.json")
-    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, sort_keys=True, indent=2)
-
     # normalize the scene
     normalize_scene()
 
     # randomize the lighting
     randomize_lighting()
 
+    if trajectory:
+        # Initial position: radius 2, Azimuth 0, Elevation 0
+        cam.location = Vector((1, 0, 0))
+        direction = -cam.location
+        cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+        current_matrix = cam.matrix_world.copy()
+        prev_action = 'X'
+        actions_taken = []
+
     # render the images
     for i in range(num_renders):
-        # set camera
-        camera = randomize_camera(
-            only_northern_hemisphere=only_northern_hemisphere,
-        )
+        if trajectory:
+            if i > 0:
+                action = get_next_action(prev_action)
+            else:
+                action = random.choice(ACTIONS)
+            current_matrix = apply_action(current_matrix, action)
+            cam.matrix_world = current_matrix
+            actions_taken.append(action)
+            prev_action = action
 
         # render the image
-        render_path = os.path.join(output_dir, f"{i:03d}.png")
+        render_path = os.path.join(output_dir, f"{i:03d}.jpg")
         scene.render.filepath = render_path
         bpy.ops.render.render(write_still=True)
 
-        # save camera RT matrix
-        rt_matrix = get_3x4_RT_matrix_from_blender(camera)
-        rt_matrix_path = os.path.join(output_dir, f"{i:03d}.npy")
-        np.save(rt_matrix_path, rt_matrix)
+    if trajectory:
+        metadata["actions"] = actions_taken
+
+    # save metadata
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, sort_keys=True, indent=2)
 
 
 if __name__ == "__main__":
@@ -860,6 +946,12 @@ if __name__ == "__main__":
         default=12,
         help="Number of renders to save of the object.",
     )
+    parser.add_argument(
+        "--trajectory",
+        action="store_true",
+        help="Whether to use a trajectory of actions to render the object.",
+        default=False,
+    )
     argv = sys.argv[sys.argv.index("--") + 1 :]
     args = parser.parse_args(argv)
 
@@ -886,9 +978,16 @@ if __name__ == "__main__":
     scene.cycles.use_denoising = True
     scene.render.film_transparent = True
     bpy.context.preferences.addons["cycles"].preferences.get_devices()
-    bpy.context.preferences.addons[
-        "cycles"
-    ].preferences.compute_device_type = "CUDA"  # or "OPENCL"
+    if sys.platform == "darwin":
+        bpy.context.preferences.addons["cycles"].preferences.compute_device_type = "METAL"
+        for device in bpy.context.preferences.addons["cycles"].preferences.devices:
+            if device.type == "METAL":
+                device.use = True
+            else:
+                device.use = False
+    else:
+        # Default behavior for other platforms (e.g., CUDA/OPTIX if configured)
+        pass
 
     # Render the images
     render_object(
@@ -896,4 +995,5 @@ if __name__ == "__main__":
         num_renders=args.num_renders,
         only_northern_hemisphere=args.only_northern_hemisphere,
         output_dir=args.output_dir,
+        trajectory=args.trajectory,
     )
